@@ -31,6 +31,10 @@ Gateway PC <--CSI UART-- RX <--Wi-Fi packets----- TX
 ESP-IDF 환경을 연 뒤 각 프로젝트 디렉터리에서 실행합니다. ESP-IDF
 `v6.0.1`과 ESP32-S3에서 빌드 및 실기기 동작을 확인했습니다.
 
+Windows에서는 일부 ESP-IDF/CMake 도구가 한글 등 비 ASCII 경로에서
+비정상 종료할 수 있습니다. `C:\Espressif\projects\firmware`처럼 영문 경로에
+저장소를 복제하는 것을 권장합니다.
+
 TX:
 
 ```powershell
