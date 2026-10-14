@@ -18,3 +18,10 @@ Thumbs.db
 firmware_backups/
 captures/
 data/
+
+# Versioned RX installation package and reproducible component resolution
+!prebuilt/rx/**/*.bin
+!csi_recv/dependencies.lock
+__pycache__/
+.pytest_cache/
+*.py[cod]

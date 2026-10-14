@@ -24,6 +24,8 @@
 #include "nvs_flash.h"
 
 #include "esp_csi_gain_ctrl.h"
+#include "esp_app_desc.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -32,6 +34,15 @@
 #include "rom/ets_sys.h"
 
 #include "csi_control_protocol.h"
+#include "rx_csi_format.h"
+
+#if !CONFIG_IDF_TARGET_ESP32S3 || ESP_IDF_VERSION != ESP_IDF_VERSION_VAL(6, 0, 1)
+#error "RX Base64 firmware is validated for ESP32-S3 with ESP-IDF 6.0.1 only"
+#endif
+
+_Static_assert(sizeof(csi_ctrl_packet_t) == RX_CSI_CONTROL_BYTES, "control size changed");
+_Static_assert(CSI_CTRL_MAGIC == RX_CSI_CONTROL_MAGIC, "control magic changed");
+_Static_assert(CSI_CTRL_VERSION == RX_CSI_CONTROL_VERSION, "control version changed");
 
 #define CONFIG_LESS_INTERFERENCE_CHANNEL 11
 #if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61 ||                 \
@@ -70,7 +81,34 @@ static const uint8_t ESPNOW_BROADCAST_MAC[] = {0xff, 0xff, 0xff,
                                                0xff, 0xff, 0xff};
 static const char *TAG = "csi_recv";
 static QueueHandle_t s_status_queue;
+static QueueHandle_t s_csi_queue;
 static SemaphoreHandle_t s_console_mutex;
+static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+
+typedef struct {
+  wifi_pkt_rx_ctrl_t rx_ctrl;
+  uint32_t id;
+  uint16_t len;
+  uint8_t mac[6];
+  uint8_t agc_gain;
+  int8_t fft_gain;
+  bool first_word_invalid;
+  bool use_gain_baseline;
+  uint8_t gain_samples_seen;
+  int8_t data[RX_CSI_MAX_BYTES];
+} rx_csi_record_t;
+
+typedef struct { uint8_t agc; int8_t fft; } rx_gain_sample_t;
+static rx_gain_sample_t s_gain_samples[100];
+static unsigned s_gain_sample_count;
+
+typedef struct {
+  uint64_t matching_data, queued, output, queue_dropped;
+  uint64_t invalid_length, invalid_payload, control_filtered;
+  uint64_t status_queue_dropped;
+  uint32_t min_len, max_len;
+} rx_csi_stats_t;
+static rx_csi_stats_t s_stats = {.min_len = UINT32_MAX};
 
 #define RX_STATUS_QUEUE_DEPTH 8
 #define RX_UART_LINE_MAX 128
@@ -153,7 +191,7 @@ static void wifi_init() {
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
                            const uint8_t *data, int data_len) {
-  if (recv_info == NULL ||
+  if (recv_info == NULL || recv_info->src_addr == NULL ||
       memcmp(recv_info->src_addr, CONFIG_CSI_SEND_MAC, 6) != 0) {
     return;
   }
@@ -176,8 +214,9 @@ static void espnow_recv_cb(const uint8_t *src_addr, const uint8_t *data,
   }
 
   if (xQueueSend(s_status_queue, &response, 0) != pdTRUE) {
-    ESP_LOGW(TAG, "status queue full, request=%" PRIu32,
-             response.request_id);
+    portENTER_CRITICAL(&s_stats_lock);
+    s_stats.status_queue_dropped++;
+    portEXIT_CRITICAL(&s_stats_lock);
   }
 }
 
@@ -194,129 +233,166 @@ static void wifi_esp_now_init(esp_now_peer_info_t peer) {
   ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
 }
 
+/* Wi-Fi task: bounded validation/snapshot only. Never format, log, allocate,
+ * wait on a mutex, or invoke gain calibration here. */
 static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info) {
-  if (!info || !info->buf) {
-    ESP_LOGW(TAG, "<%s> wifi_csi_cb", esp_err_to_name(ESP_ERR_INVALID_ARG));
+  (void)ctx;
+  if (info == NULL || memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6) != 0) {
     return;
   }
 
-  if (memcmp(info->mac, CONFIG_CSI_SEND_MAC, 6)) {
-    return;
-  }
-
-  /* A TX status response also produces CSI because it comes from the same
-   * radio. Do not feed that control frame into the sensing dataset. ESP-NOW
-   * application bytes begin at payload offset 15 in this example. */
-  if (info->payload != NULL && info->rx_ctrl.sig_len >= 19) {
-    uint32_t payload_magic = 0;
-    memcpy(&payload_magic, info->payload + 15, sizeof(payload_magic));
-    if (payload_magic == CSI_CTRL_MAGIC) {
-      return;
+  uint32_t sequence = 0;
+  rx_csi_payload_kind_t kind =
+      rx_csi_parse_action(info->payload, info->payload_len, &sequence);
+  if (kind != RX_CSI_PAYLOAD_DATA) {
+    portENTER_CRITICAL(&s_stats_lock);
+    if (kind == RX_CSI_PAYLOAD_CONTROL) {
+      s_stats.control_filtered++;
+    } else {
+      s_stats.invalid_payload++;
     }
-  }
-
-  if (xSemaphoreTake(s_console_mutex, portMAX_DELAY) != pdTRUE) {
+    portEXIT_CRITICAL(&s_stats_lock);
     return;
   }
 
-  const wifi_pkt_rx_ctrl_t *rx_ctrl = &info->rx_ctrl;
-  static int s_count = 0;
-  float compensate_gain = 1.0f;
+  bool length_valid = info->buf != NULL && rx_csi_length_valid(info->len);
+  portENTER_CRITICAL(&s_stats_lock);
+  s_stats.matching_data++;
+  if (info->len < s_stats.min_len) s_stats.min_len = info->len;
+  if (info->len > s_stats.max_len) s_stats.max_len = info->len;
+  if (!length_valid) s_stats.invalid_length++;
+  portEXIT_CRITICAL(&s_stats_lock);
+  if (!length_valid) return;
 
-  uint8_t agc_gain = 0;
-  int8_t fft_gain = 0;
-
-  // Extract per-packet RX gain values.
-  esp_csi_gain_ctrl_get_rx_gain(rx_ctrl, &agc_gain, &fft_gain);
-
+  rx_csi_record_t record = {
+      .rx_ctrl = info->rx_ctrl,
+      .id = sequence,
+      .len = info->len,
+      .first_word_invalid = info->first_word_invalid,
+  };
+  memcpy(record.mac, info->mac, sizeof(record.mac));
+  memcpy(record.data, info->buf, record.len);
+  /* gain_ctrl 0.1.5, IDF 6.0/S3: with non-null arguments this getter only
+   * snapshots the two gain bytes from rx_ctrl. Calibration may allocate/log. */
+  esp_csi_gain_ctrl_get_rx_gain(&info->rx_ctrl, &record.agc_gain, &record.fft_gain);
 #if CONFIG_GAIN_CONTROL
-  static uint8_t agc_gain_baseline = 0;
-  static int8_t fft_gain_baseline = 0;
+  portENTER_CRITICAL(&s_stats_lock);
+  record.use_gain_baseline = s_gain_sample_count == 100;
+  if (s_gain_sample_count < 100) {
+    s_gain_samples[s_gain_sample_count++] =
+        (rx_gain_sample_t){.agc = record.agc_gain, .fft = record.fft_gain};
+  }
+  record.gain_samples_seen = (uint8_t)s_gain_sample_count;
+  portEXIT_CRITICAL(&s_stats_lock);
+#endif
+  /* Capture the first 100 gain samples even when output is backlogged, so
+   * queue drops cannot change which received samples define the baseline. */
+  BaseType_t queued = xQueueSend(s_csi_queue, &record, 0);
+  portENTER_CRITICAL(&s_stats_lock);
+  if (queued == pdTRUE) s_stats.queued++;
+  else s_stats.queue_dropped++;
+  portEXIT_CRITICAL(&s_stats_lock);
+}
 
-  if (s_count < 100) {
-    esp_csi_gain_ctrl_record_rx_gain(agc_gain, fft_gain);
-  } else if (s_count == 100) {
-    esp_csi_gain_ctrl_get_rx_gain_baseline(&agc_gain_baseline,
-                                           &fft_gain_baseline);
+static void csi_output_task(void *arg) {
+  (void)arg;
+  rx_csi_record_t record;
+  char line[RX_CSI_LINE_CAPACITY];
+#if CONFIG_GAIN_CONTROL
+  rx_csi_gain_progress_t gain_progress = {0};
+#endif
+  uint64_t output_count = 0;
+  if (xSemaphoreTake(s_console_mutex, portMAX_DELAY) == pdTRUE) {
+    printf("CSI_RX_READY,1,%s,%u,%u\n", esp_app_get_description()->version,
+           (unsigned)RX_CSI_QUEUE_DEPTH, (unsigned)RX_CSI_MAX_BYTES);
+    puts(RX_CSI_CSV_HEADER);
+    fflush(stdout);
+    xSemaphoreGive(s_console_mutex);
+  }
+
+  while (true) {
+    if (xQueueReceive(s_csi_queue, &record, portMAX_DELAY) != pdTRUE) continue;
+    if (xSemaphoreTake(s_console_mutex, portMAX_DELAY) != pdTRUE) continue;
+    float compensate_gain = 1.0f;
+#if CONFIG_GAIN_CONTROL
+    rx_csi_gain_step_t gain_step;
+    bool gain_order_valid = rx_csi_gain_advance(&gain_progress,
+        record.gain_samples_seen, record.use_gain_baseline, &gain_step);
+    configASSERT(gain_order_valid);
+    if (gain_order_valid) {
+      rx_gain_sample_t samples[100];
+      if (gain_step.begin < gain_step.end) {
+        portENTER_CRITICAL(&s_stats_lock);
+        memcpy(samples, s_gain_samples, sizeof(samples));
+        portEXIT_CRITICAL(&s_stats_lock);
+      }
+      for (unsigned i = gain_step.begin; i < gain_step.end; i++) {
+        float sample_compensation = 1.0f;
+        esp_csi_gain_ctrl_record_rx_gain(samples[i].agc, samples[i].fft);
+        /* The library can create/retry its baseline inside either call.
+         * Replay both even for CSI records dropped by the output queue. */
+        esp_csi_gain_ctrl_get_gain_compensation(&sample_compensation,
+                                                samples[i].agc, samples[i].fft);
+        if (!record.use_gain_baseline && i + 1 == gain_step.end) {
+          compensate_gain = sample_compensation;
+        }
+      }
+      if (gain_step.request_baseline) {
+        uint8_t agc_gain_baseline = 0;
+        int8_t fft_gain_baseline = 0;
+        esp_csi_gain_ctrl_get_rx_gain_baseline(&agc_gain_baseline,
+                                               &fft_gain_baseline);
 #if CONFIG_FORCE_GAIN
-    esp_csi_gain_ctrl_set_rx_force_gain(agc_gain_baseline, fft_gain_baseline);
-    ESP_LOGD(TAG, "fft_force %d, agc_force %d", fft_gain_baseline,
-             agc_gain_baseline);
+        esp_csi_gain_ctrl_set_rx_force_gain(agc_gain_baseline, fft_gain_baseline);
+        ESP_LOGD(TAG, "fft_force %d, agc_force %u", fft_gain_baseline,
+                 (unsigned)agc_gain_baseline);
 #endif
-  }
-
-  esp_csi_gain_ctrl_get_gain_compensation(&compensate_gain, agc_gain, fft_gain);
+      }
+      if (record.use_gain_baseline) {
+        esp_csi_gain_ctrl_get_gain_compensation(&compensate_gain, record.agc_gain,
+                                                record.fft_gain);
+      }
+    }
 #endif
-
-  int compensate_gain_x1000000 = (int)(compensate_gain * 1000000.0f + 0.5f);
-
-  // Console/debug log. Printed sparsely so the HTML viewer does not freeze.
-  // CSV still contains gain values for every CSI_DATA row.
-  if ((s_count % 100) == 0) {
-    printf("GAIN,%d,%u,%d,%d\n", rx_ctrl->rssi, agc_gain, fft_gain,
-           compensate_gain_x1000000);
-#if CONFIG_GAIN_CONTROL
-    ESP_LOGI(TAG, "compensate_gain_x1000000 %d, agc_gain %u, fft_gain %d",
-             compensate_gain_x1000000, agc_gain, fft_gain);
-#endif
+    const wifi_pkt_rx_ctrl_t *r = &record.rx_ctrl;
+    rx_csi_fields_t fields = {
+        .id = record.id, .rssi = r->rssi, .rate = r->rate,
+        .sig_mode = r->sig_mode, .mcs = r->mcs, .bandwidth = r->cwb,
+        .smoothing = r->smoothing, .not_sounding = r->not_sounding,
+        .aggregation = r->aggregation, .stbc = r->stbc,
+        .fec_coding = r->fec_coding, .sgi = r->sgi,
+        .noise_floor = r->noise_floor, .fft_gain = record.fft_gain,
+        .agc_gain = record.agc_gain,
+        .compensate_gain_x1000000 = (int32_t)(compensate_gain * 1000000.0f + 0.5f),
+        .ampdu_cnt = r->ampdu_cnt, .channel = r->channel,
+        .secondary_channel = r->secondary_channel,
+        .local_timestamp = r->timestamp, .ant = r->ant, .sig_len = r->sig_len,
+        .rx_format = r->sig_mode, .first_word = record.first_word_invalid,
+    };
+    memcpy(fields.mac, record.mac, sizeof(fields.mac));
+    bool formatted = rx_csi_format_line(&fields, record.data, record.len,
+                                         line, sizeof(line));
+    configASSERT(formatted);
+    if (formatted) {
+      if ((output_count % 100) == 0) {
+        printf("GAIN,%d,%u,%d,%" PRId32 "\n", (int)r->rssi,
+               (unsigned)record.agc_gain, (int)record.fft_gain,
+               fields.compensate_gain_x1000000);
+        ESP_LOGI(TAG, "compensate_gain_x1000000 %" PRId32
+                 ", agc_gain %u, fft_gain %d", fields.compensate_gain_x1000000,
+                 (unsigned)record.agc_gain, (int)record.fft_gain);
+      }
+      int result = fputs(line, stdout);
+      int flushed = fflush(stdout);
+      if (result >= 0 && flushed == 0) {
+        portENTER_CRITICAL(&s_stats_lock);
+        s_stats.output++;
+        portEXIT_CRITICAL(&s_stats_lock);
+      }
+      output_count++;
+    }
+    xSemaphoreGive(s_console_mutex);
   }
-
-  uint32_t rx_id = *(uint32_t *)(info->payload + 15);
-#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 ||                  \
-    CONFIG_IDF_TARGET_ESP32C61
-  if (!s_count) {
-    ESP_LOGI(TAG, "================ CSI RECV ================");
-    ets_printf("type,seq,mac,rssi,rate,noise_floor,fft_gain,agc_gain,"
-               "compensate_gain_x1000000,channel,local_timestamp,sig_len,rx_format,len,"
-               "first_word,data\n");
-  }
-
-  ets_printf("CSI_DATA,%d," MACSTR ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
-             rx_id, MAC2STR(info->mac), rx_ctrl->rssi, rx_ctrl->rate,
-             rx_ctrl->noise_floor, fft_gain, agc_gain,
-             compensate_gain_x1000000, rx_ctrl->channel, rx_ctrl->timestamp,
-             rx_ctrl->sig_len, rx_ctrl->cur_bb_format);
-#else
-  if (!s_count) {
-    ESP_LOGI(TAG, "================ CSI RECV ================");
-    ets_printf("type,id,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,not_"
-               "sounding,aggregation,stbc,fec_coding,sgi,noise_floor,fft_gain,"
-               "agc_gain,compensate_gain_x1000000,ampdu_cnt,channel,secondary_channel,"
-               "local_timestamp,ant,sig_len,rx_format,len,first_word,data\n");
-  }
-
-  ets_printf("CSI_DATA,%d," MACSTR
-             ",%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
-             rx_id, MAC2STR(info->mac), rx_ctrl->rssi, rx_ctrl->rate,
-             rx_ctrl->sig_mode, rx_ctrl->mcs, rx_ctrl->cwb, rx_ctrl->smoothing,
-             rx_ctrl->not_sounding, rx_ctrl->aggregation, rx_ctrl->stbc,
-             rx_ctrl->fec_coding, rx_ctrl->sgi, rx_ctrl->noise_floor, fft_gain,
-             agc_gain, compensate_gain_x1000000, rx_ctrl->ampdu_cnt,
-             rx_ctrl->channel, rx_ctrl->secondary_channel, rx_ctrl->timestamp,
-             rx_ctrl->ant, rx_ctrl->sig_len, rx_ctrl->sig_mode);
-
-#endif
-#if (CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C61) && CSI_FORCE_LLTF
-  int16_t csi =
-      ((int16_t)(((((uint16_t)info->buf[1]) << 8) | info->buf[0]) << 4) >> 4);
-  ets_printf(",%d,%d,\"[%d", (info->len - 2) / 2, info->first_word_invalid,
-             (int16_t)(compensate_gain * csi));
-  for (int i = 2; i < (info->len - 2); i += 2) {
-    csi =
-        ((int16_t)(((((uint16_t)info->buf[i + 1]) << 8) | info->buf[i]) << 4) >>
-         4);
-    ets_printf(",%d", (int16_t)(compensate_gain * csi));
-  }
-#else
-  ets_printf(",%d,%d,\"[%d", info->len, info->first_word_invalid,
-             (int16_t)(info->buf[0]));
-  for (int i = 1; i < info->len; i++) {
-    ets_printf(",%d", (int16_t)(info->buf[i]));
-  }
-#endif
-  ets_printf("]\"\n");
-  s_count++;
-  xSemaphoreGive(s_console_mutex);
 }
 
 static void wifi_csi_init() {
@@ -365,6 +441,24 @@ static void wifi_csi_init() {
   ESP_ERROR_CHECK(esp_wifi_set_csi_config(&csi_config));
   ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(wifi_csi_rx_cb, NULL));
   ESP_ERROR_CHECK(esp_wifi_set_csi(true));
+}
+
+static void console_print_rx_stats(uint32_t request_id) {
+  rx_csi_stats_t stats;
+  portENTER_CRITICAL(&s_stats_lock);
+  stats = s_stats;
+  portEXIT_CRITICAL(&s_stats_lock);
+  if (stats.min_len == UINT32_MAX) stats.min_len = 0;
+  if (xSemaphoreTake(s_console_mutex, portMAX_DELAY) != pdTRUE) return;
+  printf("CSI_RX_STATS,%" PRIu32 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+         ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu32
+         ",%" PRIu32 ",%" PRIu64 "\n",
+         request_id, stats.matching_data, stats.queued, stats.output,
+         stats.queue_dropped, stats.invalid_length, stats.invalid_payload,
+         stats.control_filtered, stats.min_len, stats.max_len,
+         stats.status_queue_dropped);
+  fflush(stdout);
+  xSemaphoreGive(s_console_mutex);
 }
 
 static void console_print_status(const char *prefix,
@@ -444,6 +538,10 @@ static void uart_command_task(void *arg) {
 
     line[strcspn(line, "\r\n")] = '\0';
     uint32_t request_id = 0;
+    if (rx_csi_parse_stats_command(line, &request_id)) {
+      console_print_rx_stats(request_id);
+      continue;
+    }
     unsigned int rate_hz = 0;
     int tx_power_qdbm = 0;
     int consumed = 0;
@@ -509,6 +607,8 @@ void app_main(void) {
   s_status_queue =
       xQueueCreate(RX_STATUS_QUEUE_DEPTH, sizeof(csi_ctrl_packet_t));
   ESP_ERROR_CHECK(s_status_queue != NULL ? ESP_OK : ESP_ERR_NO_MEM);
+  s_csi_queue = xQueueCreate(RX_CSI_QUEUE_DEPTH, sizeof(rx_csi_record_t));
+  ESP_ERROR_CHECK(s_csi_queue != NULL ? ESP_OK : ESP_ERR_NO_MEM);
   s_console_mutex = xSemaphoreCreateMutex();
   ESP_ERROR_CHECK(s_console_mutex != NULL ? ESP_OK : ESP_ERR_NO_MEM);
 
@@ -532,6 +632,9 @@ void app_main(void) {
 
   wifi_esp_now_init(peer);
 
+  BaseType_t csi_task_created =
+      xTaskCreate(csi_output_task, "csi_output", 6144, NULL, 4, NULL);
+  ESP_ERROR_CHECK(csi_task_created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
   wifi_csi_init();
 
   BaseType_t status_task_created =
