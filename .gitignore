@@ -21,6 +21,7 @@ data/
 
 # Versioned RX installation package and reproducible component resolution
 !prebuilt/rx/**/*.bin
+!prebuilt/rx-2.0.1-recovered/**/*.bin
 !csi_recv/dependencies.lock
 __pycache__/
 .pytest_cache/

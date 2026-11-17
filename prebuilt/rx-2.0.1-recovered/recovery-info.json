@@ -1,0 +1,47 @@
+{
+  "firmware_version": "2.0.1-rx-b64",
+  "provenance": "Read-only recovery from an operating RX on 2026-11-17; not a source rebuild.",
+  "project": "csi_recv",
+  "target": "esp32s3",
+  "idf_version": "v6.0.1",
+  "compile_time": "2026-10-15 18:50:13",
+  "app_elf_sha256": "f4ac3fec62a1bff580d1843c9210bedccf77943ec97ce9f26bd2a808e48db123",
+  "source_status": "Matching 2.0.1 source and ELF not found. csi_recv/ remains 2.0.0; do not claim correspondence.",
+  "verified": [
+    "App and bootloader image checksums and embedded SHA256 digests",
+    "App version and full ELF hash match the connected RX",
+    "NVS and RF calibration data excluded from package"
+  ],
+  "hardware_validation": "Observed boot on connected RX; no TX traffic, reflash, throughput or loss test performed.",
+  "flash_settings": {
+    "flash_mode": "dio",
+    "flash_freq": "80m",
+    "flash_size": "2MB"
+  },
+  "flash_files": {
+    "0x0": "bootloader/bootloader.bin",
+    "0xa000": "partition_table/partition-table.bin",
+    "0x20000": "csi_recv.bin"
+  },
+  "binary_files": [
+    {
+      "path": "bootloader/bootloader.bin",
+      "bytes": 21072,
+      "sha256": "1b24e1c02a3f7660604e1343534d812df21bd49fbd59ebe8ed2d21dd2b9d4403"
+    },
+    {
+      "path": "partition_table/partition-table.bin",
+      "bytes": 4096,
+      "sha256": "60d26ce8045d66820133785454d1f44f6a404cf7019185a09957e721b2d331dd"
+    },
+    {
+      "path": "csi_recv.bin",
+      "bytes": 754704,
+      "sha256": "9f74bdb6f40b089b187cb8f5fb25e89ba43a5686290b6dad6be5a61a2819ceb9"
+    }
+  ],
+  "dump_sha256": {
+    "app_partition": "def9dc4b39e5a2c2c8248f13147e2230c207bb9d2a36582d4ddb5cf040465943",
+    "boot_and_partition": "e13e81e73d8bfc8984f86b089bc4bdaa9b37e7782fc276cbe6743715a5080897"
+  }
+}
